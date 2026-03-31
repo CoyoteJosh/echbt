@@ -1,17 +1,17 @@
 #include "Arduino.h"
 #include "heltec.h"
-#include "BLEDevice.h"
+#include "NimBLEDevice.h"
 #include "icons.h"
 #include "device.h"
 #include "power.h"
 
 static boolean connected = false;
 
-static BLERemoteCharacteristic* writeCharacteristic;
-static BLERemoteCharacteristic* sensorCharacteristic;
-static BLEAdvertisedDevice* device;
-static BLEClient* client;
-static BLEScan* scanner;
+static NimBLERemoteCharacteristic* writeCharacteristic;
+static NimBLERemoteCharacteristic* sensorCharacteristic;
+static NimBLEAdvertisedDevice* device;
+static NimBLEClient* client;
+static NimBLEScan* scanner;
 
 const unsigned long ScreenTimeoutMillis = 120000;
 
@@ -26,7 +26,7 @@ static unsigned long last_cadence = 0;
 #define maxResistance 32
 
 // Called when device sends update notification
-static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* data, size_t length, bool isNotify) {
+static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* data, size_t length, bool isNotify) {
   switch(data[1]) {
     // Cadence notification
     case 0xD1:
@@ -58,27 +58,30 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, ui
 }
 
 // Called on connect or disconnect
-class ClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) {
+class ClientCallback : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient* pclient) {
     digitalWrite(LED,HIGH);
     Serial.println("Connected!");
   }
-  void onDisconnect(BLEClient* pclient) {
+  void onDisconnect(NimBLEClient* pclient) {
     connected = false;
-    delete(client);
+    NimBLEDevice::deleteClient(client);
     client = nullptr;
     digitalWrite(LED,LOW);
     Serial.println("Disconnected!");
   }
 };
 
-class AdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
+class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
     Serial.print("BLE Advertised Device found: ");
-    Serial.println(advertisedDevice.toString().c_str());
-    if(advertisedDevice.getName().size() > 0) {
-      BLEAdvertisedDevice * d = new BLEAdvertisedDevice;
-      *d = advertisedDevice;
+    Serial.println(advertisedDevice->toString().c_str());
+    std::string name = advertisedDevice->getName();
+    bool isEchelon = advertisedDevice->isAdvertisingService(connectUUID) ||
+                     (name.size() >= 3 && name.substr(0, 3) == "ECH");
+    if(isEchelon) {
+      NimBLEAdvertisedDevice * d = new NimBLEAdvertisedDevice;
+      *d = *advertisedDevice;
       addDevice(d);
     }
   }
@@ -147,17 +150,15 @@ bool connectToServer() {
   Heltec.display->drawLogBuffer(0, 0);
   Heltec.display->display();
     
-  client = BLEDevice::createClient();
+  client = NimBLEDevice::createClient();
   client->setClientCallbacks(new ClientCallback());
-  client->connect(device);
-
-  // Sometimes it immediately disconnects - client will be null if so
-  delay(200);
-  if(client == nullptr) {
+  if(!client->connect(device)) {
+    NimBLEDevice::deleteClient(client);
+    client = nullptr;
     return false;
   }
-  
-  BLERemoteService* remoteService = client->getService(connectUUID);
+
+  NimBLERemoteService* remoteService = client->getService(connectUUID);
   if (remoteService == nullptr) {
     Serial.print("Failed to find service UUID: ");
     Serial.println(connectUUID.toString().c_str());
@@ -174,7 +175,7 @@ bool connectToServer() {
     client->disconnect();
     return false;
   }
-  sensorCharacteristic->registerForNotify(notifyCallback);
+  sensorCharacteristic->subscribe(true, notifyCallback);
   Serial.println("Enabled sensor notifications.");
 
   // Look for the write service
@@ -210,12 +211,12 @@ void setup() {
   pinMode(KEY_BUILTIN, OUTPUT);
   digitalWrite(KEY_BUILTIN, HIGH);
 
-  BLEDevice::init("");
-  scanner = BLEDevice::getScan();
+  NimBLEDevice::init("");
+  scanner = NimBLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
-  scanner->setInterval(1349);
-  scanner->setWindow(449);
-  scanner->setActiveScan(true);
+  scanner->setInterval(100);
+  scanner->setWindow(100);
+  scanner->setActiveScan(false);
 }
 
 void loop() {
@@ -229,8 +230,13 @@ void loop() {
     Heltec.display->println("Starting Scan..");
     Heltec.display->drawLogBuffer(0, 0);
     Heltec.display->display();
-    scanner->start(6, false); // Scan for 5 seconds
-    BLEDevice::getScan()->stop();
+    device_count = 0;
+    scanner->clearResults();
+    scanner->setActiveScan(true);
+    scanner->setInterval(100);
+    scanner->setWindow(100);
+    scanner->start(15, false);
+    NimBLEDevice::getScan()->stop();
 
     device = selectDevice(); // Pick a device
     if(device != nullptr) {

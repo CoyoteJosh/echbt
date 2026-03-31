@@ -1,32 +1,29 @@
 // The Echelon Services
-static BLEUUID     deviceUUID("0bf669f0-45f2-11e7-9598-0800200c9a66");
-static BLEUUID    connectUUID("0bf669f1-45f2-11e7-9598-0800200c9a66");
-static BLEUUID      writeUUID("0bf669f2-45f2-11e7-9598-0800200c9a66");
-static BLEUUID     sensorUUID("0bf669f4-45f2-11e7-9598-0800200c9a66");
+static NimBLEUUID    connectUUID("0bf669f1-45f2-11e7-9598-0800200c9a66");
+static NimBLEUUID      writeUUID("0bf669f2-45f2-11e7-9598-0800200c9a66");
+static NimBLEUUID     sensorUUID("0bf669f4-45f2-11e7-9598-0800200c9a66");
 
-static BLEAdvertisedDevice * devices[20];
+static NimBLEAdvertisedDevice * devices[20];
 static int device_count = 0;
 
 // button handling
 #define BUTTON_DEBOUNCE_TIME 50
 #define BUTTON_SHORT_PRESS_TIME 400
 
-// Add a device to our device list (deduplicate in the process)
-void addDevice(BLEAdvertisedDevice * device) {
+// Add a device to our device list (deduplicate by address)
+void addDevice(NimBLEAdvertisedDevice * device) {
+  if(device_count >= 20) return;
   for (uint8_t i = 0; i < device_count; i++) {
-    if(device->getName() == devices[i]->getName()){
+    if(device->getAddress().equals(devices[i]->getAddress())){
       return;
     }
-  }
-  if(!device->haveServiceUUID() || !device->isAdvertisingService(deviceUUID)) {
-    return;
   }
   devices[device_count] = device;
   device_count++;
 }
 
 // Select a device and return it
-BLEAdvertisedDevice * selectDevice(void) {
+NimBLEAdvertisedDevice * selectDevice(void) {
   Heltec.display->setFont(ArialMT_Plain_10);
 
   if(device_count == 0) return nullptr;
@@ -48,7 +45,11 @@ BLEAdvertisedDevice * selectDevice(void) {
       } else {
         Heltec.display->print("   ");
       }
-      Heltec.display->println(devices[i]->getName().c_str());
+      if(devices[i]->getName().size() > 0) {
+        Heltec.display->println(devices[i]->getName().c_str());
+      } else {
+        Heltec.display->println(devices[i]->getAddress().toString().c_str());
+      }
     }
     Heltec.display->drawLogBuffer(0, 0);
     Heltec.display->display();

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(code --version)",
+      "Bash(code --list-extensions)",
+      "Bash(code:*)",
+      "Bash(git ls-remote:*)"
+    ]
+  }
+}
