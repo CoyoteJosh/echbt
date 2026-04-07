@@ -1,11 +1,18 @@
 #include "Arduino.h"
-#include "heltec.h"
+#include <TFT_eSPI.h>
 #include "NimBLEDevice.h"
-#include "icons.h"
 #include "device.h"
 #include "power.h"
 
+TFT_eSPI tft = TFT_eSPI();
+
+// CYD RGB LED (active low)
+#define LED_R  4
+#define LED_G 16
+#define LED_B 17
+
 static boolean connected = false;
+static bool screenOn = false;
 
 static NimBLERemoteCharacteristic* writeCharacteristic;
 static NimBLERemoteCharacteristic* sensorCharacteristic;
@@ -27,10 +34,28 @@ static unsigned long last_cadence = 0;
 
 // Called when device sends update notification
 static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* data, size_t length, bool isNotify) {
+  // Log non-D1 packets always, D1 only when data changes
+  static uint8_t prev_d1[13] = {0};
+  if(data[1] != 0xD1) {
+    Serial.printf("PKT[%02X] len=%d:", data[1], length);
+    for(int i = 0; i < length; i++) Serial.printf(" %02X", data[i]);
+    Serial.println();
+  } else {
+    bool changed = false;
+    for(int i = 0; i < length && i < 13; i++) {
+      if(data[i] != prev_d1[i]) { changed = true; break; }
+    }
+    if(changed) {
+      Serial.printf("D1 CHANGED:");
+      for(int i = 0; i < length; i++) Serial.printf(" %02X", data[i]);
+      Serial.println();
+      memcpy(prev_d1, data, length < 13 ? length : 13);
+    }
+  }
+
   switch(data[1]) {
     // Cadence notification
     case 0xD1:
-      //runtime = int((data[7] << 8) + data[8]); // This runtime has massive drift
       cadence = int((data[9] << 8) + data[10]);
       power = getPower(cadence, resistance);
       break;
@@ -40,7 +65,7 @@ static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
       power = getPower(cadence, resistance);
       break;
   }
-  
+
   if(debug) {
     Serial.print("CALLBACK(");
     Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
@@ -48,9 +73,7 @@ static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
     Serial.print(length);
     Serial.print("):");
     for(int x = 0; x < length; x++) {
-      if(data[x] < 16) {
-        Serial.print("0");
-      }
+      if(data[x] < 16) Serial.print("0");
       Serial.print(data[x], HEX);
     }
     Serial.println();
@@ -60,22 +83,22 @@ static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
 // Called on connect or disconnect
 class ClientCallback : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pclient) {
-    digitalWrite(LED,HIGH);
+    digitalWrite(LED_G, LOW);   // green on
+    digitalWrite(LED_R, HIGH);  // red off
     Serial.println("Connected!");
   }
   void onDisconnect(NimBLEClient* pclient) {
     connected = false;
     NimBLEDevice::deleteClient(client);
     client = nullptr;
-    digitalWrite(LED,LOW);
+    digitalWrite(LED_G, HIGH);  // green off
+    digitalWrite(LED_R, LOW);   // red on
     Serial.println("Disconnected!");
   }
 };
 
 class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-    Serial.print("BLE Advertised Device found: ");
-    Serial.println(advertisedDevice->toString().c_str());
     std::string name = advertisedDevice->getName();
     bool isEchelon = advertisedDevice->isAdvertisingService(connectUUID) ||
                      (name.size() >= 3 && name.substr(0, 3) == "ECH");
@@ -86,73 +109,109 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     }
   }
 };
-    
-void updateDisplay() {
-  Heltec.display->clear();
 
-  // Screen Timeout
-  if(last_millis - last_cadence > ScreenTimeoutMillis) {
-    Heltec.display->display();
+// Draw the static display layout (called once on connect / screen wake)
+void drawLayout() {
+  tft.fillScreen(TFT_BLACK);
+
+  // Header bar
+  tft.fillRect(0, 0, 320, 40, TFT_NAVY);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_CYAN, TFT_NAVY);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString("ECHBT", 10, 20);
+  tft.drawFastHLine(0, 40, 320, TFT_CYAN);
+
+  // Dividers
+  tft.drawFastVLine(160, 40, 152, TFT_DARKGREY);
+  tft.drawFastHLine(0, 192, 320, TFT_DARKGREY);
+
+  // Metric labels
+  tft.setTextFont(2);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("CADENCE", 80, 46);
+  tft.drawString("RPM", 80, 158);
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("POWER", 240, 46);
+  tft.drawString("W", 240, 158);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("RESISTANCE", 5, 213);
+}
+
+void updateDisplay() {
+  bool shouldBeOn = (last_millis - last_cadence <= ScreenTimeoutMillis);
+
+  if (!shouldBeOn) {
+    if (screenOn) {
+      tft.fillScreen(TFT_BLACK);
+      screenOn = false;
+    }
     return;
   }
-  
-  // Runtime
-  Heltec.display->setFont(ArialMT_Plain_24);
-  char buf[5];
-  const int minutes = int(runtime / 60000);
-  itoa(minutes, buf, 10);
-  Heltec.display->setTextAlignment(TEXT_ALIGN_RIGHT);
-  Heltec.display->drawString(48, 0, buf);
-  Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
-  Heltec.display->drawXbm(0, 4, clock_icon_width, clock_icon_height, clock_icon);
-  Heltec.display->drawString(48, 0, ":");
-  const int seconds = int(runtime % 60000)/1000;
-  if(seconds < 10) {
-    buf[0] = '0';
-    itoa(seconds, &buf[1], 10);  
-  } else {
-    itoa(seconds, buf, 10);  
+
+  if (!screenOn) {
+    drawLayout();
+    screenOn = true;
   }
-  Heltec.display->drawString(54, 0, buf);
+
+  // Runtime
+  const int minutes = int(runtime / 60000);
+  const int seconds = int(runtime % 60000) / 1000;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%02d:%02d", minutes, seconds);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(buf, 310, 20);
 
   // Cadence
-  Heltec.display->drawXbm(0, 26, cadence_icon_width, cadence_icon_height, cadence_icon);
+  tft.setTextFont(7);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextPadding(tft.textWidth("000", 7));
   itoa(cadence, buf, 10);
-  Heltec.display->drawString(22, 22, buf);
+  tft.drawString(buf, 80, 108);
 
   // Power
-  Heltec.display->drawXbm(66, 26, power_icon_width, power_icon_height, power_icon);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   itoa(power, buf, 10);
-  Heltec.display->drawString(86, 22, buf);
+  tft.drawString(buf, 240, 108);
+  tft.setTextPadding(0);
 
-  // Resistance
-  Heltec.display->setTextAlignment(TEXT_ALIGN_CENTER);
-  itoa(getPeletonResistance(resistance), buf, 10);
-  Heltec.display->drawString(116, 42, buf);
-  Heltec.display->drawXbm(0, 52, resistance_icon_width, resistance_icon_height, resistance_icon);
-  Heltec.display->drawProgressBar(23, 49, 78, 14, uint8_t((100 * resistance) / maxResistance));
+  // Resistance progress bar
+  int barWidth = (245 * resistance) / maxResistance;
+  tft.fillRect(5, 225, 245, 10, TFT_DARKGREY);
+  if (barWidth > 0) tft.fillRect(5, 225, barWidth, 10, TFT_GREEN);
 
-  // Echelon Icon
-  Heltec.display->drawXbm(100, 3, echelon_icon_width, echelon_icon_height, echelon_icon);
-
-  Heltec.display->display();
+  // Peloton-equivalent resistance percentage
+  int pelRes = getPeletonResistance(resistance);
+  snprintf(buf, sizeof(buf), "%d%%", pelRes);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextPadding(tft.textWidth("100%", 2));
+  tft.drawString(buf, 315, 213);
+  tft.setTextPadding(0);
 }
 
 bool connectToServer() {
   Serial.print("Connecting to ");
   Serial.println(device->getName().c_str());
 
-  Heltec.display->clear();
-  Heltec.display->setLogBuffer(10, 50);
-  Heltec.display->setFont(ArialMT_Plain_10);
-  Heltec.display->println("Connecting to:");
-  Heltec.display->println(device->getName().c_str());
-  Heltec.display->drawLogBuffer(0, 0);
-  Heltec.display->display();
-    
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Connecting to:", 160, 100);
+  tft.drawString(device->getName().c_str(), 160, 130);
+
   client = NimBLEDevice::createClient();
   client->setClientCallbacks(new ClientCallback());
-  if(!client->connect(device)) {
+  if (!client->connect(device)) {
     NimBLEDevice::deleteClient(client);
     client = nullptr;
     return false;
@@ -167,7 +226,6 @@ bool connectToServer() {
   }
   Serial.println("Found device.");
 
-  // Look for the sensor
   sensorCharacteristic = remoteService->getCharacteristic(sensorUUID);
   if (sensorCharacteristic == nullptr) {
     Serial.print("Failed to find sensor characteristic UUID: ");
@@ -178,7 +236,6 @@ bool connectToServer() {
   sensorCharacteristic->subscribe(true, notifyCallback);
   Serial.println("Enabled sensor notifications.");
 
-  // Look for the write service
   writeCharacteristic = remoteService->getCharacteristic(writeUUID);
   if (writeCharacteristic == nullptr) {
     Serial.print("Failed to find write characteristic UUID: ");
@@ -186,13 +243,12 @@ bool connectToServer() {
     client->disconnect();
     return false;
   }
-  // Enable device notifications
   byte message[] = {0xF0, 0xB0, 0x01, 0x01, 0xA2};
   writeCharacteristic->writeValue(message, 5);
   Serial.println("Activated status callbacks.");
 
-  // This will ensure the display comes on initially
-  last_cadence = millis();  
+  last_cadence = millis();
+  screenOn = false;  // force layout redraw on first updateDisplay()
 
   return true;
 }
@@ -201,15 +257,23 @@ void setup() {
   Serial.begin(115200);
   Serial.flush();
   delay(50);
-    
-  Heltec.display->init();
-  // Heltec.display->flipScreenVertically();
-  
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
 
-  pinMode(KEY_BUILTIN, OUTPUT);
-  digitalWrite(KEY_BUILTIN, HIGH);
+  // TFT init — backlight must be on before init
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  tft.init();
+  tft.setRotation(1);  // landscape 320x240
+  tft.fillScreen(TFT_BLACK);
+
+  // RGB LED (active low on CYD)
+  pinMode(LED_R, OUTPUT); digitalWrite(LED_R, HIGH);
+  pinMode(LED_G, OUTPUT); digitalWrite(LED_G, HIGH);
+  pinMode(LED_B, OUTPUT); digitalWrite(LED_B, HIGH);
+
+  // BOOT button used for device selection
+  pinMode(0, INPUT_PULLUP);
+
+  tft.fillScreen(TFT_BLACK);
 
   NimBLEDevice::init("");
   scanner = NimBLEDevice::getScan();
@@ -220,16 +284,14 @@ void setup() {
 }
 
 void loop() {
-  // Start scan
-  if(!connected){
+  if (!connected) {
     Serial.println("Start Scan!");
-    Heltec.display->clear();
-    Heltec.display->drawXbm(64, 0, mountain_icon_width, mountain_icon_height, mountain_icon);
-    Heltec.display->setLogBuffer(10, 50);
-    Heltec.display->setFont(ArialMT_Plain_10);
-    Heltec.display->println("Starting Scan..");
-    Heltec.display->drawLogBuffer(0, 0);
-    Heltec.display->display();
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Scanning for Echelon...", 160, 110);
+
     device_count = 0;
     scanner->clearResults();
     scanner->setActiveScan(true);
@@ -238,39 +300,53 @@ void loop() {
     scanner->start(15, false);
     NimBLEDevice::getScan()->stop();
 
-    device = selectDevice(); // Pick a device
-    if(device != nullptr) {
+    device = selectDevice();
+    if (device != nullptr) {
       connected = connectToServer();
-      if(!connected) {
+      if (!connected) {
         Serial.println("Failed to connect...");
-        Heltec.display->println("Failed to");
-        Heltec.display->println("connect...");
-        Heltec.display->drawLogBuffer(0, 0);
-        Heltec.display->display();
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextFont(4);
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("Connection failed", 160, 100);
+        tft.drawString("Retrying...", 160, 135);
         delay(1100);
         return;
       }
     } else {
       Serial.println("No device found...");
-      Heltec.display->println("No device"); 
-      Heltec.display->println("found...");
-      Heltec.display->drawLogBuffer(0, 0);
-      Heltec.display->display();
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextFont(4);
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString("No Echelon found", 160, 100);
+      tft.drawString("Retrying...", 160, 135);
       delay(1100);
       return;
     }
   }
 
+  // Send keepalive to prevent bike from disconnecting
+  static unsigned long last_keepalive = 0;
+  if (millis() - last_keepalive > 10000) {
+    byte message[] = {0xF0, 0xB0, 0x01, 0x01, 0xA2};
+    writeCharacteristic->writeValue(message, 5);
+    last_keepalive = millis();
+  }
+
   // Update timer if cadence is rolling
-  if(cadence > 0) {
+  if (cadence > 0) {
     unsigned long now = millis();
     runtime += now - last_millis;
     last_millis = now;
     last_cadence = now;
   } else {
-    last_millis = millis();  
+    last_millis = millis();
   }
-  
-  delay(200); // Delay 200ms between loops.
-  updateDisplay();
+
+  delay(500);
+  // Temporarily skip display to test if SPI interferes with BLE
+  // updateDisplay();
+  Serial.printf("cad=%d res=%d pwr=%d\n", cadence, resistance, power);
 }
